@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "eduardo.calendar",
+  "name": "Calendar",
+  "version": "0.1.0",
+  "author": "Eduardo Lorenzo",
+  "license": "MIT",
+  "description": "Clock with the ongoing and next meeting, a month + week calendar popup, and alerts before a meeting starts.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Calendar",
+    "description": "Date/time, ongoing and next meeting, month + week calendar popup",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "format": "dddd HH:mm",
+      "formatAlt": "d MMMM 'W'ww yyyy",
+      "verticalFormat": "HH\n—\nmm"
+    }
+  }
+}

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Add or re-authorize a Google account: opens the browser, catches the callback on loopback.
+
+Writes progress to ~/.cache/omarchy-calendar/status.json so the panel can show
+what happened without a terminal in sight.
+"""
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import _common as C
+
+C.reexec_into_venv()
+
+
+PID_PATH = os.path.join(C.CACHE_DIR, "auth.pid")
+
+
+def take_over():
+    """A second click means the first flow looked stuck, so replace it.
+
+    Each run holds a loopback server waiting for one callback; leaving the old
+    one alive strands it there and pins the panel on "waiting for the browser"
+    forever, which is exactly what it did the first time out.
+    """
+    previous = (C.read_json(PID_PATH, {}) or {}).get("pid") or 0
+    pid = int(previous)
+    if pid > 0 and pid != os.getpid():
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as handle:
+                mine = b"omarchy-calendar-auth" in handle.read()
+        except OSError:
+            mine = False
+        if mine:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    C.write_json_atomic(PID_PATH, {"pid": os.getpid(), "at": C.now_epoch()})
+
+
+def status(state, message="", label=""):
+    C.write_json_atomic(C.STATUS_PATH, {
+        "state": state,
+        "message": message,
+        "label": label,
+        "at": C.now_epoch(),
+    })
+
+
+def primary_email(creds):
+    try:
+        service = C.build_service(creds)
+        return service.calendars().get(calendarId="primary").execute().get("id", "")
+    except Exception:
+        return ""
+
+
+def run_flow():
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    flow = InstalledAppFlow.from_client_secrets_file(C.CLIENT_SECRET_PATH, C.SCOPES)
+    # port 0 lets the OS pick; desktop clients accept any loopback port
+    return flow.run_local_server(
+        port=0,
+        open_browser=True,
+        access_type="offline",
+        prompt="consent",
+        authorization_prompt_message="",
+        success_message="Account connected. You can close this tab and go back to the bar.",
+    )
+
+
+def upsert_account(config, label, email):
+    account = C.account_by_label(config, label)
+    if account is None:
+        priorities = [int(a.get("priority", 0)) for a in config["accounts"]] or [0]
+        account = {
+            "label": label,
+            "email": email,
+            "priority": max(priorities) + 1,
+            "color": C.next_color(config),
+            "calendars": ["*"],
+            "enabled": True,
+        }
+        config["accounts"].append(account)
+    else:
+        account["email"] = email or account.get("email", "")
+        account["enabled"] = True
+    return account
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--label", default="", help="name shown on the chip, e.g. work")
+    parser.add_argument("--sync", action="store_true", help="run a sync right after")
+    args = parser.parse_args()
+
+    C.ensure_dirs()
+    if not os.path.exists(C.CLIENT_SECRET_PATH):
+        status("error", "missing-client-secret", args.label)
+        print("No %s. See the README: create a Desktop OAuth client and drop it there." % C.CLIENT_SECRET_PATH, file=sys.stderr)
+        return 2
+
+    # A Web client's JSON looks close enough to pass a glance and then fails the
+    # flow with redirect_uri_mismatch; say so here instead.
+    secret = C.read_json(C.CLIENT_SECRET_PATH, {}) or {}
+    if "installed" not in secret:
+        kind = "web client" if "web" in secret else "unrecognised client file"
+        status("error", "wrong-client-type: %s" % kind, args.label)
+        print("client_secret.json is a %s. Create an OAuth client of type 'Desktop app'." % kind, file=sys.stderr)
+        return 2
+
+    take_over()
+    status("waiting", "browser opened, waiting for consent", args.label)
+    try:
+        creds = run_flow()
+    except Exception as exc:  # noqa: BLE001 - user cancelled, port blocked, org policy...
+        status("error", "%s: %s" % (type(exc).__name__, exc), args.label)
+        print("auth failed: %s" % exc, file=sys.stderr)
+        return 1
+
+    email = primary_email(creds)
+    label = args.label.strip() or (email.split("@")[0] if email else "account")
+
+    config = C.load_config()
+    upsert_account(config, label, email)
+    C.save_config(config)
+    C.save_credentials(label, creds)
+    status("ok", email or label, label)
+    print("connected %s as '%s'" % (email or "account", label))
+
+    # The timer stays off until there is something to sync, so a fresh install
+    # does not spend every minute reporting that no account is configured.
+    subprocess.run(["systemctl", "--user", "enable", "--now", "omarchy-calendar-sync.timer"], check=False)
+
+    if args.sync:
+        subprocess.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "omarchy-calendar-sync")], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

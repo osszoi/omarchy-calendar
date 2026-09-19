@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Pull every configured Google account into ~/.cache/omarchy-calendar/events.json.
+
+Failures never blank the bar: an account that cannot be reached keeps the events
+from its last good sync and is marked stale, so the panel can say how old it is.
+"""
+
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import _common as C
+
+C.reexec_into_venv()
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+NOTIFIED_PATH = os.path.join(C.CACHE_DIR, "reauth-notified.json")
+NOTIFY_EVERY = 6 * 3600
+GLYPH = "\U000f00ed"
+
+
+def warn_expired(label, error):
+    """A dead token is silent otherwise: the bar just stops learning anything new.
+
+    Once every few hours is enough to be noticed without becoming wallpaper, and
+    the toast carries the re-auth command so it is one click rather than a hunt
+    through the README."""
+    notified = C.read_json(NOTIFIED_PATH, {}) or {}
+    now = C.now_epoch()
+    if now - int(notified.get(label) or 0) < NOTIFY_EVERY:
+        return
+    notified[label] = now
+    C.write_json_atomic(NOTIFIED_PATH, notified)
+
+    subprocess.run([
+        "omarchy-notification-send",
+        "-u", "critical",
+        "-g", GLYPH,
+        "Calendar: %s needs signing in again" % label,
+        "Google dropped the token (%s). Click to re-authorize." % str(error).split(":")[0],
+        "--exec", os.path.join(HERE, "omarchy-calendar-auth"), "--label", label, "--sync",
+    ], check=False)
+
+
+def calendars_for(service, account):
+    wanted = account.get("calendars") or ["*"]
+    entries = []
+    page = None
+    while True:
+        response = service.calendarList().list(pageToken=page, showHidden=False).execute()
+        entries.extend(response.get("items") or [])
+        page = response.get("nextPageToken")
+        if not page:
+            break
+
+    if "*" in wanted:
+        return [(e["id"], e.get("summaryOverride") or e.get("summary") or e["id"]) for e in entries if not e.get("hidden")]
+
+    by_id = {e["id"]: e for e in entries}
+    picked = []
+    for wanted_id in wanted:
+        entry = by_id.get(wanted_id)
+        if wanted_id == "primary":
+            entry = next((e for e in entries if e.get("primary")), entry)
+        if entry:
+            picked.append((entry["id"], entry.get("summaryOverride") or entry.get("summary") or entry["id"]))
+    return picked
+
+
+def fetch_ics(config, account):
+    import _ics
+
+    url = str(account.get("url") or "")
+    if not url:
+        return None, "no-url"
+
+    text = _ics.fetch(url)
+    start, end = C.window_dt(config)
+    name, events = _ics.events_from(text, account, start, end)
+    filters = C.filters_for(config, account)
+    return [e for e in events if C.should_keep(e, filters)], None
+
+
+def fetch_account(config, account):
+    if str(account.get("type") or "google") == "ics":
+        return fetch_ics(config, account)
+
+    creds = C.load_credentials(account["label"])
+    if creds is None:
+        return None, "no-token"
+    creds, error = C.refresh_credentials(account["label"], creds)
+    if error:
+        return None, error
+
+    service = C.build_service(creds)
+    time_min, time_max = C.window(config)
+    filters = C.filters_for(config, account)
+    events = []
+
+    for calendar_id, calendar_name in calendars_for(service, account):
+        page = None
+        while True:
+            response = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=250,
+                pageToken=page,
+            ).execute()
+            for raw in response.get("items") or []:
+                event = C.normalize_event(raw, account, calendar_id, calendar_name)
+                if C.should_keep(event, filters):
+                    events.append(event)
+            page = response.get("nextPageToken")
+            if not page:
+                break
+
+    return events, None
+
+
+def explain(config):
+    """Why is the calendar empty? Counts what each filter dropped, per calendar.
+
+    A personal calendar is mostly events with no other attendees, so skipSolo
+    alone can take a whole account down to nothing.
+    """
+    time_min, time_max = C.window(config)
+
+    for account in config.get("accounts", []):
+        filters = C.filters_for(config, account)
+        creds = C.load_credentials(account["label"])
+        creds, error = C.refresh_credentials(account["label"], creds) if creds else (None, "no-token")
+        if error:
+            print("%s: %s" % (account["label"], error))
+            continue
+
+        service = C.build_service(creds)
+        print("%s (%s)" % (account["label"], account.get("email", "")))
+        for calendar_id, calendar_name in calendars_for(service, account):
+            total = 0
+            dropped = {"allDay": 0, "declined": 0, "free": 0, "solo": 0, "cancelled": 0}
+            kept = 0
+            page = None
+            while True:
+                response = service.events().list(
+                    calendarId=calendar_id, timeMin=time_min, timeMax=time_max,
+                    singleEvents=True, orderBy="startTime", maxResults=250, pageToken=page,
+                ).execute()
+                for raw in response.get("items") or []:
+                    total += 1
+                    event = C.normalize_event(raw, account, calendar_id, calendar_name)
+                    if event["status"] == "cancelled":
+                        dropped["cancelled"] += 1
+                    elif event["allDay"] and filters.get("skipAllDay", True):
+                        dropped["allDay"] += 1
+                    elif event["response"] == "declined" and filters.get("skipDeclined", True):
+                        dropped["declined"] += 1
+                    elif event["transparency"] == "transparent" and filters.get("skipFree", True):
+                        dropped["free"] += 1
+                    elif event["attendees"] == 0 and filters.get("skipSolo", True):
+                        dropped["solo"] += 1
+                    else:
+                        kept += 1
+                page = response.get("nextPageToken")
+                if not page:
+                    break
+            reasons = ", ".join("%s %d" % (k, v) for k, v in dropped.items() if v)
+            print("  %-40s %3d found, %3d kept%s" % (calendar_name[:40], total, kept,
+                                                     " (dropped: %s)" % reasons if reasons else ""))
+    return 0
+
+
+def main():
+    if "--explain" in sys.argv:
+        return explain(C.load_config())
+
+    C.ensure_dirs()
+    config = C.load_config()
+    previous = C.read_json(C.EVENTS_PATH, {}) or {}
+    previous_events = previous.get("events") or []
+    previous_accounts = {a.get("label"): a for a in (previous.get("accounts") or [])}
+
+    now = C.now_epoch()
+    events = []
+    accounts = []
+
+    for account in config.get("accounts", []):
+        if account.get("enabled") is False:
+            continue
+        label = account.get("label")
+        state = {
+            "label": label,
+            "priority": int(account.get("priority", 99)),
+            "color": account.get("color") or "#7aa2f7",
+            "status": "ok",
+            "error": "",
+            "syncedAt": now,
+            "lastOkAt": now,
+        }
+        try:
+            fetched, error = fetch_account(config, account)
+        except Exception as exc:  # noqa: BLE001 - any API/transport failure is "stale", never fatal
+            fetched, error = None, "%s: %s" % (type(exc).__name__, exc)
+
+        if error:
+            kept = [e for e in previous_events if e.get("account") == label]
+            events.extend(kept)
+            old = previous_accounts.get(label) or {}
+            state["status"] = "needs-reauth" if str(error).startswith(("needs-reauth", "no-token")) else "stale"
+            state["error"] = str(error)
+            # Only for a token that existed and died. An account row with no
+            # token yet is mid-setup, and the panel already says so.
+            if str(error).startswith("needs-reauth"):
+                warn_expired(label, error)
+            state["lastOkAt"] = int(old.get("lastOkAt") or 0)
+            state["events"] = len(kept)
+        else:
+            events.extend(fetched)
+            state["events"] = len(fetched)
+        accounts.append(state)
+
+    events.sort(key=lambda e: (e["start"], e["priority"], e["title"]))
+    C.write_json_atomic(C.EVENTS_PATH, {
+        "version": 1,
+        "syncedAt": now,
+        "accounts": accounts,
+        "leadMinutes": config.get("leadMinutes", [5, 1]),
+        "upcomingWindowMinutes": config.get("upcomingWindowMinutes", 60),
+        "catchUpMinutes": config.get("catchUpMinutes", 10),
+        "maxTitleChars": config.get("maxTitleChars", 28),
+        "events": events,
+    })
+
+    broken = [a["label"] for a in accounts if a["status"] != "ok"]
+    print("synced %d events from %d account(s)%s" % (
+        len(events), len(accounts), "; degraded: " + ", ".join(broken) if broken else ""))
+    return 1 if broken else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

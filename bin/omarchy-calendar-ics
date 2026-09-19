@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Add a calendar that is read from an iCalendar URL instead of the API.
+
+For accounts whose organization blocks third-party OAuth clients: the URL is
+the calendar's own "secret address", so nothing has to be approved. Treat it
+like a password — anyone holding it can read the calendar.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import _common as C
+
+C.reexec_into_venv()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--label", required=True, help="name on the chip, e.g. otherjob")
+    parser.add_argument("--url", required=True, help="secret address in iCal format")
+    parser.add_argument("--email", default="", help="your address in that calendar, so declines are detected")
+    parser.add_argument("--measure-lag", action="store_true",
+                        help="poll until the feed changes, to see how fresh it really is")
+    args = parser.parse_args()
+
+    import _ics
+
+    C.ensure_dirs()
+    config = C.load_config()
+
+    if args.measure_lag:
+        return measure(config, args.label)
+
+    try:
+        text = _ics.fetch(args.url)
+    except Exception as exc:  # noqa: BLE001
+        print("could not fetch that URL: %s" % exc, file=sys.stderr)
+        return 1
+
+    if "BEGIN:VCALENDAR" not in text:
+        print("that URL did not return an iCalendar feed", file=sys.stderr)
+        return 1
+
+    account = C.account_by_label(config, args.label)
+    if account is None:
+        priorities = [int(a.get("priority", 0)) for a in config["accounts"]] or [0]
+        account = {"label": args.label, "priority": max(priorities) + 1, "color": C.next_color(config)}
+        config["accounts"].append(account)
+    account.update({"type": "ics", "url": args.url, "email": args.email, "enabled": True})
+
+    start, end = C.window_dt(config)
+    name, events = _ics.events_from(text, account, start, end)
+    kept = [e for e in events if C.should_keep(e, C.filters_for(config, account))]
+    first, last = _ics.span(text)
+
+    C.save_config(config)
+    print("'%s' -> %s: %d occurrences in the window, %d after filters" % (args.label, name, len(events), len(kept)))
+    if first and last:
+        print("feed covers %s to %s" % (first, last))
+
+    subprocess.run(["systemctl", "--user", "enable", "--now", "omarchy-calendar-sync.timer"], check=False)
+    subprocess.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "omarchy-calendar-sync")], check=False)
+    return 0
+
+
+def measure(config, label):
+    """How long between changing something in that calendar and seeing it here."""
+    import hashlib
+    import time
+
+    import _ics
+
+    account = C.account_by_label(config, label)
+    if account is None or not account.get("url"):
+        print("no ICS account labelled '%s'" % label, file=sys.stderr)
+        return 1
+
+    def digest():
+        body = _ics.fetch(account["url"])
+        stripped = "\n".join(line for line in body.splitlines() if not line.startswith("DTSTAMP"))
+        return hashlib.sha256(stripped.encode()).hexdigest(), body
+
+    started = time.time()
+    baseline, _ = digest()
+    print("baseline taken. Change something in that calendar now (move an event, add one).")
+    print("polling every 30s for up to 60 minutes...")
+    while time.time() - started < 3600:
+        time.sleep(30)
+        current, _ = digest()
+        if current != baseline:
+            elapsed = int(time.time() - started)
+            print("feed changed after %dm%02ds" % (elapsed // 60, elapsed % 60))
+            return 0
+        print("  %dm: unchanged" % int((time.time() - started) / 60))
+    print("no change seen in 60 minutes")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

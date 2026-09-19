@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Edit the account list from the panel: remove one, or move its precedence."""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import _common as C
+
+C.reexec_into_venv()
+
+
+def renumber(config):
+    accounts = sorted(config["accounts"], key=lambda a: int(a.get("priority", 99)))
+    for index, account in enumerate(accounts):
+        account["priority"] = index + 1
+    config["accounts"] = accounts
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("label")
+    parser.add_argument("--remove", action="store_true")
+    parser.add_argument("--up", action="store_true")
+    parser.add_argument("--down", action="store_true")
+    parser.add_argument("--rename", default="")
+    args = parser.parse_args()
+
+    config = C.load_config()
+    account = C.account_by_label(config, args.label)
+    if account is None:
+        print("no account labelled '%s'" % args.label, file=sys.stderr)
+        return 1
+
+    if args.rename:
+        new_label = args.rename.strip()
+        if C.account_by_label(config, new_label) is not None:
+            print("'%s' is already taken" % new_label, file=sys.stderr)
+            return 1
+        # The token file is named after the label, so the rename has to carry it
+        # or the account comes back as "needs signing in again".
+        old_token, new_token = C.token_path(args.label), C.token_path(new_label)
+        if os.path.exists(old_token):
+            os.replace(old_token, new_token)
+        account["label"] = new_label
+        # Alerts already fired are keyed by event id, which starts with the
+        # label; leave them be rather than re-alerting a renamed account's day.
+    elif args.remove:
+        config["accounts"] = [a for a in config["accounts"] if a is not account]
+        try:
+            os.unlink(C.token_path(args.label))
+        except OSError:
+            pass
+    elif args.up or args.down:
+        account["priority"] = int(account.get("priority", 99)) + (-1.5 if args.up else 1.5)
+
+    renumber(config)
+    C.save_config(config)
+    subprocess_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omarchy-calendar-sync")
+    os.execv(subprocess_path, [subprocess_path])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
