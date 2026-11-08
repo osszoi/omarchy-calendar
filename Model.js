@@ -114,6 +114,7 @@ function stepMonth(year, month, delta) {
 
 var CLOCK_FORMATS = [
   "dddd HH:mm",
+  "dddd dd/MM/yy HH:mm",
   "dddd h:mm AP",
   "HH:mm",
   "h:mm AP",
