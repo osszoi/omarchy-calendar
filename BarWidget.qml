@@ -36,7 +36,9 @@ BarWidget {
   readonly property var formatRing: Model.clockFormatRing(configuredFormat, configuredAltFormat, Model.clockFormats(vertical))
 
   readonly property string clockText: Qt.formatDateTime(displayDate,
-    configuredFormat.replace(/ww/g, Model.isoWeekLiteral(displayDate.getFullYear(), displayDate.getMonth(), displayDate.getDate())))
+    configuredFormat
+      .replace(/ww/g, Model.isoWeekLiteral(displayDate.getFullYear(), displayDate.getMonth(), displayDate.getDate()))
+      .replace(/do/g, Model.ordinalDayLiteral(displayDate.getDate())))
   readonly property var verticalLines: clockText.split("\n")
 
   readonly property var selection: Model.barSelection(store.events, nowEpoch, store.upcomingWindowMinutes)

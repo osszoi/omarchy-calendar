@@ -43,6 +43,13 @@ test("iso week matches the stock clock", function() {
   assert.strictEqual(M.isoWeek(2026, 0, 1), 1)
 })
 
+test("ordinal day suffixes, teens included", function() {
+  var expected = { 1: "st", 2: "nd", 3: "rd", 4: "th", 8: "th", 11: "th", 12: "th", 13: "th", 21: "st", 22: "nd", 23: "rd", 30: "th", 31: "st" }
+  Object.keys(expected).forEach(function(day) {
+    assert.strictEqual(M.ordinalDayLiteral(Number(day)), day + "'" + expected[day] + "'")
+  })
+})
+
 test("three overlapping events get three columns", function() {
   var placed = M.packOverlaps([
     event("a", 10, 0, 60),

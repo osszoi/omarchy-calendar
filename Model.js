@@ -67,6 +67,14 @@ function isoWeekLiteral(year, month, day) {
   return pad2(isoWeek(year, month, day))
 }
 
+// suffix goes quoted, t and h are qt format tokens
+function ordinalDayLiteral(day) {
+  var n = Number(day)
+  var suffix = "th"
+  if (n % 100 < 11 || n % 100 > 13) suffix = ({ 1: "st", 2: "nd", 3: "rd" })[n % 10] || "th"
+  return n + "'" + suffix + "'"
+}
+
 // Always six rows of seven days, so the panel is the same height every month.
 function monthGrid(year, month, weekStart, todayKey) {
   var start = normalizedWeekStart(weekStart, 1)
@@ -114,7 +122,7 @@ function stepMonth(year, month, delta) {
 
 var CLOCK_FORMATS = [
   "dddd HH:mm",
-  "dddd dd/MM/yy HH:mm",
+  "dddd MMMM do — HH:mm",
   "dddd h:mm AP",
   "HH:mm",
   "h:mm AP",
@@ -492,6 +500,7 @@ if (typeof module !== "undefined") {
     weekdayOrder: weekdayOrder,
     isoWeek: isoWeek,
     isoWeekLiteral: isoWeekLiteral,
+    ordinalDayLiteral: ordinalDayLiteral,
     monthGrid: monthGrid,
     stepMonth: stepMonth,
     clockFormats: clockFormats,
